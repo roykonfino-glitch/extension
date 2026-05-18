@@ -544,8 +544,8 @@ export default function ChatPage() {
     // Load versions in background — chat is already unlocked via hasCredentials
     if (initial?.playSession) handleConnect(true);
     // Extension mode: auto-load playbook if tab URL contains a playbook GUID
-    if (extensionMode && initial?.baseUrl && initial?.tabUrl) {
-      const guidMatch = initial.tabUrl.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
+    if (extensionMode && initial?.baseUrl && urlParams?.tabUrl) {
+      const guidMatch = urlParams.tabUrl.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
       if (guidMatch) {
         const playbookGuid = guidMatch[0];
         const sid = sessionId.current;
