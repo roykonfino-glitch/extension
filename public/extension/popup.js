@@ -37,7 +37,7 @@ chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
     document.getElementById('connectBtn').addEventListener('click', () => {
       const baseUrl = document.getElementById('tenantUrl').value.trim() || tabOrigin;
       chrome.storage.local.set({ [STORAGE_KEY]: baseUrl });
-      chrome.storage.session.set({ dhConnect: { baseUrl } });
+      chrome.storage.session.set({ dhConnect: { baseUrl, tabUrl: tabUrl } });
 
       if (chrome.sidePanel?.open) {
         chrome.sidePanel.open({ windowId: tab.windowId }, () => {

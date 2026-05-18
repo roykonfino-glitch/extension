@@ -16,7 +16,8 @@ const TOOLS: Anthropic.Tool[] = [
   { name: 'playbook_inspect_question', description: 'Return full JSON for one question. Use "Group.Question" if ambiguous.', input_schema: { type: 'object', properties: { questionName: { type: 'string' } }, required: ['questionName'] } },
   { name: 'group_create', description: 'Add a question group to the loaded playbook.', input_schema: { type: 'object', properties: { name: { type: 'string' }, displayedName: { type: 'string' }, kind: { type: 'string', enum: ['regular', 'repeatable'] } }, required: ['name', 'displayedName', 'kind'] } },
   { name: 'group_delete', description: 'Delete a group from the loaded playbook.', input_schema: { type: 'object', properties: { groupName: { type: 'string' } }, required: ['groupName'] } },
-  { name: 'question_create', description: 'Add a question to a group.', input_schema: { type: 'object', properties: { groupName: { type: 'string' }, name: { type: 'string' }, label: { type: 'string' }, type: { type: 'string', enum: ['text','text_list','numeric','date','date_formula','calculated','textarea'] }, textListValues: { type: 'array', items: { type: 'string' } }, textListDefault: { type: 'string' }, numericMin: { type: 'number' }, numericMax: { type: 'number' }, formula: { type: 'string' }, isMandatory: { type: 'boolean' }, defaultValue: { type: 'string' } }, required: ['groupName','name','label','type'] } },
+  { name: 'question_create', description: 'Add a single question to a group. Use questions_bulk_create when adding 2 or more questions.', input_schema: { type: 'object', properties: { groupName: { type: 'string' }, name: { type: 'string' }, label: { type: 'string' }, type: { type: 'string', enum: ['text','text_list','numeric','date','date_formula','calculated','textarea'] }, textListValues: { type: 'array', items: { type: 'string' } }, textListDefault: { type: 'string' }, numericMin: { type: 'number' }, numericMax: { type: 'number' }, formula: { type: 'string' }, isMandatory: { type: 'boolean' }, defaultValue: { type: 'string' } }, required: ['groupName','name','label','type'] } },
+  { name: 'questions_bulk_create', description: 'Add multiple questions to a group in one call. Always prefer this over repeated question_create calls.', input_schema: { type: 'object', properties: { groupName: { type: 'string' }, questions: { type: 'array', items: { type: 'object', properties: { name: { type: 'string' }, label: { type: 'string' }, type: { type: 'string', enum: ['text','text_list','numeric','date','date_formula','calculated','textarea'] }, textListValues: { type: 'array', items: { type: 'string' } }, textListDefault: { type: 'string' }, numericMin: { type: 'number' }, numericMax: { type: 'number' }, formula: { type: 'string' }, isMandatory: { type: 'boolean' }, defaultValue: { type: 'string' } }, required: ['name','label','type'] } } }, required: ['groupName','questions'] } },
   { name: 'question_update', description: 'Update properties of an existing question (label, values, formula, isMandatory, defaultValue). Prefer this over delete+recreate.', input_schema: { type: 'object', properties: { questionName: { type: 'string' }, label: { type: 'string' }, textListValues: { type: 'array', items: { type: 'string' } }, textListDefault: { type: 'string' }, numericMin: { type: 'number' }, numericMax: { type: 'number' }, formula: { type: 'string' }, isMandatory: { type: 'boolean' }, defaultValue: { type: 'string' } }, required: ['questionName'] } },
   { name: 'question_delete', description: 'Delete a question from the loaded playbook. Only use when truly removing; never delete then recreate to change values — use question_update instead.', input_schema: { type: 'object', properties: { questionName: { type: 'string' } }, required: ['questionName'] } },
   { name: 'question_set_hidden_rule', description: 'Set a Hide rule on a question.', input_schema: { type: 'object', properties: { questionName: { type: 'string' }, rule: { type: 'string' } }, required: ['questionName','rule'] } },
@@ -25,23 +26,29 @@ const TOOLS: Anthropic.Tool[] = [
   { name: 'playbook_save', description: 'Persist the loaded playbook back to DealHub. Always call after mutations.', input_schema: { type: 'object', properties: {}, required: [] } },
 ];
 
-function buildSystem(baseUrl?: string, versionGuid?: string, versionName?: string) {
+function buildSystem(baseUrl?: string, versionGuid?: string, versionName?: string, tabUrl?: string) {
   const ctx = versionGuid
     ? `\n\n**Active context:** Tenant: ${baseUrl ?? 'unknown'} · Version: ${versionName ?? 'unknown'} (GUID: ${versionGuid})\nUse this version GUID automatically when listing/loading playbooks.`
     : '';
-  return `You are a DealHub CPQ configuration assistant. Help configure DealHub playbooks through natural language.
+  const tabCtx = tabUrl
+    ? `\n**Current tab URL:** ${tabUrl}\nIf this URL contains a playbook GUID (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx pattern), the playbook is already pre-loaded in memory — call playbook_summary immediately instead of playbook_load.`
+    : '';
+  return `You are a DealHub CPQ configuration assistant. Configure playbooks fast with minimal back-and-forth.
 
-DealHub concepts: Version (collection of playbooks, DRAFT/ACTIVE), Playbook (quote configurator with groups of questions), Group (regular=Q&A, repeatable=table rows), Question (text/text_list/numeric/date/calculated/textarea), Rules (e.g. [Group.Question] == "Yes").
+DealHub concepts: Version (DRAFT/ACTIVE), Playbook (groups of questions), Group (regular=Q&A, repeatable=table rows), Question (text/text_list/numeric/date/calculated/textarea), Rules (e.g. [Group.Question] == "Yes").
 
 Workflow: list_versions → list_playbooks → playbook_load → mutate → playbook_save.
-Skip list_versions if version is in active context. Re-call playbook_load if cache may be stale.
-Be concise. Act on requests without confirmation unless genuinely ambiguous.
+Skip list_versions if version is in context. Skip playbook_load if tab URL matches a pre-loaded playbook.
 
-RULES:
-- Always work in DRAFT versions. Never modify an ACTIVE version — if only ACTIVE exists, tell the user to create a DRAFT first.
-- To change a question's label, values, formula, or any other property: use question_update. Never delete then recreate a question just to change its values.
-- textListValues must be plain text strings only — no HTML, no Markdown, no // comments, no quotes. Example: ["Yes", "No", "Maybe"] not ["Yes // option", "<b>No</b>"].
-- If a tool returns "session expired" or "refresh your DealHub tab", stop and tell the user exactly that: "Please refresh your DealHub tab and send your message again." Do not ask them to reinstall or log in fresh.${ctx}`;
+BEHAVIOUR — follow strictly:
+- Act immediately. Never ask for confirmation before making changes. If the request is clear, do it.
+- Never ask "which playbook?" — if context has a loaded playbook, use it. If not, call playbook_summary to check, then load if needed.
+- After every mutation (create/update/delete), call playbook_save automatically. Do not ask the user if they want to save.
+- When adding 2+ questions, always use questions_bulk_create — never loop question_create.
+- Always work in DRAFT versions. If only ACTIVE exists, tell the user to create a DRAFT first, stop.
+- To change a question's properties: use question_update, never delete+recreate.
+- textListValues: plain text only — no HTML, Markdown, or // comments.
+- If a tool returns "session expired": tell the user "Please refresh your DealHub tab and try again." Stop there.${ctx}${tabCtx}`;
 }
 
 export async function POST(req: NextRequest) {
@@ -52,11 +59,12 @@ export async function POST(req: NextRequest) {
 
   (async () => {
     try {
-      const { messages, baseUrl, versionGuid, versionName } = await req.json() as {
+      const { messages, baseUrl, versionGuid, versionName, tabUrl } = await req.json() as {
         messages: Anthropic.MessageParam[];
         baseUrl?: string;
         versionGuid?: string;
         versionName?: string;
+        tabUrl?: string;
       };
 
       const claude = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
@@ -64,7 +72,7 @@ export async function POST(req: NextRequest) {
       const response = await claude.messages.create({
         model: 'claude-haiku-4-5-20251001',
         max_tokens: 2048,
-        system: buildSystem(baseUrl, versionGuid, versionName),
+        system: buildSystem(baseUrl, versionGuid, versionName, tabUrl),
         tools: TOOLS,
         messages,
       });

@@ -25,7 +25,8 @@ window.addEventListener('message', (event) => {
 function loadWhenReady(attempts) {
   chrome.storage.session.get('dhConnect', (data) => {
     if (data.dhConnect?.baseUrl) {
-      frame.src = `${APP_BASE}?baseUrl=${encodeURIComponent(data.dhConnect.baseUrl)}&ext=1`;
+      const tabPart = data.dhConnect.tabUrl ? `&tabUrl=${encodeURIComponent(data.dhConnect.tabUrl)}` : '';
+      frame.src = `${APP_BASE}?baseUrl=${encodeURIComponent(data.dhConnect.baseUrl)}&ext=1${tabPart}`;
     } else if (attempts > 0) {
       setTimeout(() => loadWhenReady(attempts - 1), 80);
     } else {

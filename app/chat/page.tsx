@@ -267,7 +267,8 @@ function getUrlParams() {
   const ext = p.get('ext') === '1';
   const jsessionid = p.get('jsessionid') ?? '';
   const playSession = p.get('playSession') ?? '';
-  if (baseUrl) return { baseUrl, jsessionid, playSession, ext };
+  const tabUrl = p.get('tabUrl') ?? '';
+  if (baseUrl) return { baseUrl, jsessionid, playSession, ext, tabUrl };
   return null;
 }
 
@@ -439,6 +440,24 @@ export default function ChatPage() {
         if (formula !== undefined) q.defaultValue = formula;
         return `Updated question "${questionName}".`;
       }
+      case 'questions_bulk_create': {
+        if (!pb) return 'No playbook loaded.';
+        const { groupName, questions } = input as { groupName: string; questions: Array<{ name: string; label: string; type: string; textListValues?: string[]; textListDefault?: string; numericMin?: number; numericMax?: number; formula?: string; isMandatory?: boolean; defaultValue?: string }> };
+        const g = requireGroup(pb, groupName);
+        const qs = g.solutionAttributes as PB[];
+        const results: string[] = [];
+        for (const qi of questions) {
+          const { name, label, type, textListValues, textListDefault, numericMin, numericMax, formula, isMandatory, defaultValue } = qi;
+          if (qs.some((q) => q.name === name)) { results.push(`SKIP "${name}" (already exists)`); continue; }
+          const q: PB = { guid: null, type: TYPE_MAP[type] ?? 'Text answer', description: '', name, note: '', tooltip: '', question: label, ordinalValue: qs.length, solutionGUID: g.guid ?? null, value: [], valueLabels: {}, excludedFilterValues: [], conditionalRules: [], presentationRules: [], showMode: 'ALWAYS', readOnlyRule: (type === 'date_formula' || type === 'calculated') ? 'true' : 'false', hiddenRule: 'false', billingAttributeType: null, timezoneIndependent: false, dayOfMonth: 'ANY', calculateWhenRule: 'true', versionGUID: pb.versionGUID, pinByDefault: false, tableColumnWidth: 220, hidden: false, defaultValue: defaultValue ?? '', readOnly: type === 'date_formula' || type === 'calculated', step: null, isRichText: type === 'textarea', multiSelect: false, calculatedAnswer: type === 'calculated', dateAttributeValueType: null, displayNumberType: 'NUMBER', isMandatory: !!isMandatory, allowEmpty: false, mantissa: 0 };
+          if (type === 'numeric') { q.value = [{ id: numericMin == null ? '5e-324' : String(numericMin), text: numericMin == null ? '5e-324' : String(numericMin) }, { id: numericMax == null ? '' : String(numericMax), text: numericMax == null ? '' : String(numericMax) }]; q.step = '1'; }
+          else if (type === 'text_list') { q.value = (textListValues ?? []).map((v) => { const e = v.replace(/"/g, '\\"'); return { id: `"${e}"`, text: `"${e}"` }; }); const def = textListDefault ?? textListValues?.[0]; if (def) q.defaultValue = `"${def}"`; }
+          else if (type === 'date_formula' || type === 'calculated') { if (!formula) { results.push(`SKIP "${name}" (formula required)`); continue; } q.dateAttributeValueType = type === 'date_formula' ? 'FORMULA' : null; q.defaultValue = formula; }
+          qs.push(q);
+          results.push(`Added "${name}" (${type})`);
+        }
+        return results.join('\n');
+      }
       case 'question_delete': {
         if (!pb) return 'No playbook loaded.';
         const { group, question } = findQuestion(pb, input.questionName as string);
@@ -524,7 +543,25 @@ export default function ChatPage() {
     }
     // Load versions in background — chat is already unlocked via hasCredentials
     if (initial?.playSession) handleConnect(true);
-    // Extension mode: auto-fetch versions so Claude skips list_versions round-trip
+    // Extension mode: auto-load playbook if tab URL contains a playbook GUID
+    if (extensionMode && initial?.baseUrl && initial?.tabUrl) {
+      const guidMatch = initial.tabUrl.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
+      if (guidMatch) {
+        const playbookGuid = guidMatch[0];
+        const sid = sessionId.current;
+        const id = Math.random().toString(36).slice(2);
+        const handler = (e: MessageEvent) => {
+          if (e.data?.type !== 'dh_api_response' || e.data?.id !== id) return;
+          window.removeEventListener('message', handler);
+          if (e.data.ok && e.data.data && typeof e.data.data === 'object' && 'solutions' in e.data.data) {
+            playbookRef.current[sid] = e.data.data as PB;
+          }
+        };
+        window.addEventListener('message', handler);
+        window.parent.postMessage({ type: 'dh_api_request', id, baseUrl: initial.baseUrl, method: 'GET', path: `/playbook?playbookGUID=${playbookGuid}` }, '*');
+      }
+    }
+    // Auto-fetch versions so Claude skips list_versions round-trip
     if (extensionMode && initial?.baseUrl) {
       const id = Math.random().toString(36).slice(2);
       const handler = (e: MessageEvent) => {
@@ -566,7 +603,7 @@ export default function ChatPage() {
         const res = await fetch('/api/claude', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ messages: history, baseUrl, versionGuid: selectedVersionGuid || undefined, versionName: selectedVersion?.name }),
+          body: JSON.stringify({ messages: history, baseUrl, versionGuid: selectedVersionGuid || undefined, versionName: selectedVersion?.name, tabUrl: urlParams?.tabUrl || undefined }),
         });
         if (!res.body) throw new Error('No response body');
 
