@@ -877,7 +877,7 @@ export default function ChatPage() {
               </div>
             )}
             <p className="text-xs mt-5" style={{ color: DH.textMuted }}>
-              Thanks to our creators <strong style={{ color: DH.textSub }}>Dor</strong> &amp; <strong style={{ color: DH.textSub }}>Roy</strong> ✨
+              Thanks to our creators <strong style={{ color: DH.textSub }}>Roy Konfino</strong> &amp; <strong style={{ color: DH.textSub }}>Dor Bar Aliya</strong> ✨
             </p>
           </div>
         )}
