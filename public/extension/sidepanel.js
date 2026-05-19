@@ -50,3 +50,19 @@ setInterval(() => {
     });
   });
 }, 4 * 60 * 1000);
+
+// Poll the active DealHub tab URL every 2 s — notify iframe when user navigates
+let lastSyncedTabUrl = '';
+setInterval(() => {
+  chrome.storage.session.get('dhConnect', (data) => {
+    if (!data.dhConnect?.baseUrl) return;
+    chrome.tabs.query({ url: '*://*.dealhub.io/*' }, (tabs) => {
+      const tab = tabs.find(t => t.url && t.url.startsWith(data.dhConnect.baseUrl)) ?? tabs[0];
+      if (!tab?.url || tab.url === lastSyncedTabUrl) return;
+      lastSyncedTabUrl = tab.url;
+      if (frame.contentWindow) {
+        frame.contentWindow.postMessage({ type: 'dh_tab_update', tabUrl: tab.url }, '*');
+      }
+    });
+  });
+}, 2000);

@@ -478,15 +478,21 @@ export default function ChatPage() {
       }
       case 'playbook_save': {
         if (!pb) return 'No playbook loaded.';
-        // Clone to avoid mutating the in-memory playbook
         const payload: PB = { ...pb };
         // Filter null-guid solutions (system-managed groups returned by GET that POST rejects)
-        // Keep newly created groups (guid: null but isNewSolution: true)
-        payload.solutions = (pb.solutions as PB[]).filter((s) => s.guid !== null || !!s.isNewSolution);
-        // Strip GET-only fields that POST rejects on EU1
+        // Strip isNewSolution marker from groups before sending to server
+        payload.solutions = (pb.solutions as PB[]).filter((s) => s.guid !== null || !!s.isNewSolution).map((s) => { const c = { ...s }; delete c.isNewSolution; return c; });
+        // Strip GET-only root fields that POST rejects
         delete payload.syncProductsToSfRule;
         delete payload.syncDocsToSfRule;
         delete payload.collapseQuoteSettingsRule;
+        // Reset state arrays that accumulate during a session — sending them causes 400 on some tenants
+        payload.deletedItems = [];
+        payload.changedSolutionAttributeAnswers = [];
+        payload.movedQuestions = [];
+        payload.changedAttributes = [];
+        payload.attributesTypeChanged = [];
+        payload.changeLogRecords = [];
         const result = await callExtApi('POST', '/playbook', payload) as PB;
         if (result && typeof result === 'object' && 'solutions' in result) playbookRef.current[sid] = result;
         return `Playbook "${pb.name}" saved successfully.`;
@@ -583,6 +589,40 @@ export default function ChatPage() {
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
+
+  // Extension: sync context when user navigates to a different playbook in DealHub
+  useEffect(() => {
+    if (!extensionMode) return;
+    const handler = (e: MessageEvent) => {
+      if (e.data?.type !== 'dh_tab_update') return;
+      const newTabUrl = e.data.tabUrl as string;
+      // Extract version GUID from hash query string (e.g. #/playbook/...?versionGUID=X&playbookGUID=Y)
+      const hashQuery = (newTabUrl.split('#')[1] ?? '').split('?')[1] ?? '';
+      const hashParams = new URLSearchParams(hashQuery);
+      const urlVersionGuid = hashParams.get('versionGUID') ?? hashParams.get('versionGuid');
+      if (urlVersionGuid) setSelectedVersionGuid(urlVersionGuid);
+      // Extract playbook GUID (UUID format)
+      const guidMatch = newTabUrl.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
+      if (!guidMatch) return;
+      const newPbGuid = guidMatch[0];
+      const current = playbookRef.current[sessionId.current];
+      if (current && String(current.guid).toLowerCase() === newPbGuid.toLowerCase()) return;
+      // Silently load the new playbook into context
+      const id = Math.random().toString(36).slice(2);
+      const loadHandler = (ev: MessageEvent) => {
+        if (ev.data?.type !== 'dh_api_response' || ev.data?.id !== id) return;
+        window.removeEventListener('message', loadHandler);
+        if (ev.data.ok && ev.data.data && typeof ev.data.data === 'object' && 'solutions' in ev.data.data) {
+          playbookRef.current[sessionId.current] = ev.data.data as PB;
+        }
+      };
+      window.addEventListener('message', loadHandler);
+      window.parent.postMessage({ type: 'dh_api_request', id, baseUrl, method: 'GET', path: `/playbook?playbookGUID=${newPbGuid}` }, '*');
+    };
+    window.addEventListener('message', handler);
+    return () => window.removeEventListener('message', handler);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [extensionMode, baseUrl]);
 
   // ── Extension-mode agentic loop ────────────────────────────────────────────
   const sendMessageExtension = async (userText: string) => {
