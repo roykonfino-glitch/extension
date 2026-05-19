@@ -71,9 +71,35 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       const result = results?.[0]?.result;
       if (!result) throw new Error('No result from tab script execution');
 
+      // On 401, reload the tab to refresh the session then retry once
       if (!result.ok && (result.status === 401 || result.status === 403 ||
           (typeof result.data === 'object' && result.data?.redirect))) {
-        sendResponse({ ok: false, status: result.status, error: 'DealHub session expired — please refresh your DealHub browser tab and try again.' });
+        await new Promise(resolve => {
+          chrome.tabs.reload(tab.id, {}, () => setTimeout(resolve, 3000));
+        });
+        const retry = await new Promise((resolve, reject) => {
+          chrome.scripting.executeScript({
+            target: { tabId: tab.id },
+            func: async (url, fetchMethod, bodyStr, csrfToken) => {
+              const headers = { 'Content-Type': 'application/json', 'Accept': 'application/json' };
+              if (csrfToken && fetchMethod !== 'GET') headers['Csrf-Token'] = csrfToken;
+              const res = await fetch(url, { method: fetchMethod, headers, body: bodyStr !== null ? bodyStr : undefined, credentials: 'include' });
+              const text = await res.text();
+              let data; try { data = JSON.parse(text); } catch { data = text; }
+              return { ok: res.ok, status: res.status, data };
+            },
+            args: [`${baseUrl}${path}`, method, body ? JSON.stringify(body) : null, csrf],
+          }, (res) => {
+            if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+            else resolve(res);
+          });
+        });
+        const retryResult = retry?.[0]?.result;
+        if (!retryResult?.ok) {
+          sendResponse({ ok: false, status: retryResult?.status, error: 'DealHub session expired — please refresh your DealHub browser tab and try again.' });
+          return;
+        }
+        sendResponse(retryResult);
         return;
       }
       sendResponse(result);

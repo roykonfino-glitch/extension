@@ -36,3 +36,17 @@ function loadWhenReady(attempts) {
 }
 
 loadWhenReady(20);
+
+// Keepalive: ping /security/timeLeft every 4 minutes to prevent session expiry
+setInterval(() => {
+  chrome.storage.session.get('dhConnect', (data) => {
+    if (!data.dhConnect?.baseUrl) return;
+    chrome.runtime.sendMessage({
+      type: 'dh_api_request',
+      id: 'keepalive',
+      baseUrl: data.dhConnect.baseUrl,
+      method: 'GET',
+      path: '/security/timeLeft',
+    });
+  });
+}, 4 * 60 * 1000);
