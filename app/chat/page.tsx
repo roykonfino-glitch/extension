@@ -858,9 +858,14 @@ export default function ChatPage() {
             {connecting ? (
               <p className="text-sm" style={{ color: DH.textMuted }}>Connecting…</p>
             ) : isConnected ? (
-              <p className="text-sm max-w-xs leading-relaxed" style={{ color: DH.textSub }}>
-                Ask me anything — add groups, create questions, set rules, load or save a playbook.
-              </p>
+              <>
+                <p className="text-sm max-w-xs leading-relaxed" style={{ color: DH.textSub }}>
+                  Ask me anything — add groups, create questions, set rules, load or save a playbook.
+                </p>
+                <p className="text-xs mt-3" style={{ color: DH.textMuted }}>
+                  Thanks to our creators <strong style={{ color: DH.textSub }}>Dor</strong> &amp; <strong style={{ color: DH.textSub }}>Roy</strong> ✨
+                </p>
+              </>
             ) : (
               <div className="space-y-3">
                 <p className="text-sm max-w-xs leading-relaxed" style={{ color: DH.textSub }}>
