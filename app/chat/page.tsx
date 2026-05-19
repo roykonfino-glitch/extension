@@ -303,6 +303,79 @@ function findQuestion(pb: PB, name: string) {
 }
 const TYPE_MAP: Record<string, string> = { text: 'Text answer', numeric: 'Numeric answer', text_list: 'Text list', date: 'Date', date_formula: 'Date', calculated: 'Calculated answer', textarea: 'Text answer' };
 
+// ── Guardrails ────────────────────────────────────────────────────────────────
+// Mirror of the lib/dealhub/playbook.ts enforcement rules so the extension
+// stops silently breaking tenants the way the raw cookie API would let it.
+
+/**
+ * Scan every rule / formula / default in the playbook for a bracketed reference
+ * to a question. Returns the list of (group, question, field, snippet) refs
+ * found. Used by deleteQuestionSafe to refuse a delete when refs exist.
+ */
+function findQuestionReferences(pb: PB, groupName: string, questionName: string): Array<{ group: string; question: string; field: string; snippet: string }> {
+  const refs: Array<{ group: string; question: string; field: string; snippet: string }> = [];
+  const bracketed = [`[${questionName}]`, `[${groupName}.${questionName}]`];
+  const contains = (s: unknown) => typeof s === 'string' && bracketed.some((b) => s.includes(b));
+  const ruleFields = ['hiddenRule', 'readOnlyRule', 'calculateWhenRule', 'defaultValue'];
+  for (const g of pb.solutions as PB[]) {
+    for (const q of (g.solutionAttributes as PB[]) ?? []) {
+      // Direct rule/formula fields on the question
+      for (const f of ruleFields) {
+        const v = q[f];
+        if (contains(v)) refs.push({ group: g.name as string, question: q.name as string, field: f, snippet: String(v).slice(0, 120) });
+      }
+      // presentationRules[].rule
+      for (const pr of (q.presentationRules as PB[]) ?? []) {
+        if (contains(pr.rule)) refs.push({ group: g.name as string, question: q.name as string, field: 'presentationRule', snippet: String(pr.rule).slice(0, 120) });
+      }
+      // conditionalRules[].rule + conditionalRules[].defaultValue
+      for (const cr of (q.conditionalRules as PB[]) ?? []) {
+        if (contains(cr.rule)) refs.push({ group: g.name as string, question: q.name as string, field: 'conditionalRule.rule', snippet: String(cr.rule).slice(0, 120) });
+        if (contains(cr.defaultValue)) refs.push({ group: g.name as string, question: q.name as string, field: 'conditionalRule.defaultValue', snippet: String(cr.defaultValue).slice(0, 120) });
+      }
+    }
+  }
+  return refs;
+}
+
+/**
+ * Preflight check for playbook_save. Mirrors lib/dealhub/playbook.ts enforcement:
+ *   - MERGE_LABEL: if both Product_Filters AND Product_Selection exist, they must
+ *     share displayedName AND Product_Selection.showSolutionTitle must be false.
+ *   - SUBSCRIPTIONS_ORDER: a Subscriptions group must come AFTER Product_Selection.
+ * Throws on violation — caller surfaces the error to the user.
+ */
+function preflightSave(pb: PB): void {
+  const groups = (pb.solutions as PB[]) ?? [];
+  const byName = (n: string) => groups.find((g) => g.name === n);
+
+  const filters = byName('Product_Filters');
+  const picker = byName('Product_Selection');
+  if (filters && picker) {
+    if (filters.displayedName !== picker.displayedName) {
+      throw new Error(
+        `[savePlaybook preflight: MERGE_LABEL] Product_Filters.displayedName ("${filters.displayedName}") must match Product_Selection.displayedName ("${picker.displayedName}"). Rename one to the other so the filter framework merges in the UI.`,
+      );
+    }
+    if (picker.showSolutionTitle !== false) {
+      throw new Error(
+        `[savePlaybook preflight: MERGE_LABEL] Product_Selection.showSolutionTitle must be false when Product_Filters is present (currently ${picker.showSolutionTitle}). Otherwise the picker renders its own title alongside the filter group's title.`,
+      );
+    }
+  }
+
+  const subs = byName('Subscriptions');
+  if (subs && picker) {
+    const subsOrdinal = groups.indexOf(subs);
+    const pickerOrdinal = groups.indexOf(picker);
+    if (subsOrdinal < pickerOrdinal) {
+      throw new Error(
+        `[savePlaybook preflight: SUBSCRIPTIONS_ORDER] Subscriptions group (ordinal ${subsOrdinal}) must come AFTER Product_Selection (ordinal ${pickerOrdinal}). Reorder the groups before saving — renewal lines will load before the picker is wired otherwise.`,
+      );
+    }
+  }
+}
+
 // ── Main page ─────────────────────────────────────────────────────────────────
 
 export default function ChatPage() {
@@ -461,6 +534,15 @@ export default function ChatPage() {
       case 'question_delete': {
         if (!pb) return 'No playbook loaded.';
         const { group, question } = findQuestion(pb, input.questionName as string);
+        // Guardrail: refuse delete if the question is referenced anywhere in the playbook.
+        // Caller can pass force=true to bypass (e.g. rolling back a just-added question).
+        if (!input.force) {
+          const refs = findQuestionReferences(pb, group.name as string, question.name as string);
+          if (refs.length > 0) {
+            const head = refs.slice(0, 10).map((r) => `  - ${r.group}.${r.question} (${r.field}): ${r.snippet}`).join('\n');
+            return `BLOCKED: question "${input.questionName}" is referenced ${refs.length}× across the playbook. Rewire or remove these refs first, or call again with force=true to delete anyway:\n${head}${refs.length > 10 ? `\n  …and ${refs.length - 10} more` : ''}`;
+          }
+        }
         group.solutionAttributes = (group.solutionAttributes as PB[]).filter((q) => q !== question);
         (group.solutionAttributes as PB[]).forEach((q, i) => { q.ordinalValue = i; });
         if (question.guid) pb.deletedItems = [...((pb.deletedItems as unknown[]) ?? []), { deletedType: 'SOLUTION_ATTRIBUTE', parentGUID: group.guid ?? pb.guid, entityGUID: question.guid }];
@@ -476,8 +558,133 @@ export default function ChatPage() {
         question.presentationRules = [{ accountGUID: pb.accountGUID, guid: '', rule: input.rule, versionGUID: pb.versionGUID, ordinal: 0, solutionAttributeGUID: question.guid ?? '', presentationRuleType: 'SOLUTION_ATTRIBUTE' }];
         return `Set presentation rule on "${input.questionName}" → ${input.rule}`;
       }
+      // ─── Version-level ─────────────────────────────────────────────────
+      case 'version_create': {
+        const { name, comment } = input as { name: string; comment?: string };
+        const res = await callExtApi('POST', '/versions/createOrUpdate', {
+          comment: comment ?? '',
+          defaultPartnerPrograms: ['', '', '', '', ''],
+          deletedPartnersGUIDs: [],
+          guid: null,
+          name,
+          status: 'DRAFT',
+        }) as PB;
+        return JSON.stringify({ guid: res.guid, name: res.name, status: res.status });
+      }
+
+      // ─── Assignment-rule templates ─────────────────────────────────────
+      case 'template_list': {
+        const { versionGuid, playbookGuid } = input as { versionGuid: string; playbookGuid?: string };
+        const qs = playbookGuid
+          ? `versionGuid=${versionGuid}&playbookGuid=${playbookGuid}`
+          : `versionGuid=${versionGuid}`;
+        const raw = await callExtApi('GET', `/masterdata/getRuleTemplates?${qs}`) as PB;
+        const templates: PB[] = (raw.templates as PB[]) ?? (raw.changedTemplates as PB[]) ?? (Array.isArray(raw) ? raw as PB[] : []);
+        return JSON.stringify(templates.map((t) => ({ guid: t.guid, name: t.name, assignmentRule: t.assignmentRule })), null, 2);
+      }
+      case 'template_save': {
+        const { versionGuid, playbookGuid, changedTemplates, deletedTemplates } = input as { versionGuid: string; playbookGuid: string; changedTemplates: PB[]; deletedTemplates?: string[] };
+        await callExtApi('POST', '/masterdata/saveRuleTemplates', {
+          playbookGuid,
+          versionGuid,
+          changedTemplates,
+          deletedTemplates: deletedTemplates ?? [],
+          changeLogRecords: [],
+        });
+        return `Saved ${changedTemplates.length} template(s)${deletedTemplates?.length ? `, deleted ${deletedTemplates.length}` : ''}.`;
+      }
+
+      // ─── External Query (with SF auto-fix) ─────────────────────────────
+      case 'external_query_create': {
+        const { versionGuid, name, description, queryType, triggerType, queryText, entityName, cacheExpirationHours } = input as { versionGuid: string; name: string; description?: string; queryType: string; triggerType: string; queryText: string; entityName?: string; cacheExpirationHours?: number };
+        let sfMappingNote: string | null = null;
+        // SF auto-fix: if the SOQL references EXTERNAL_FIELD(Account.Id) and the
+        // version's SF mapping is missing it, add it before saving the query.
+        if (queryType === 'CRM' && /EXTERNAL_FIELD\(Account\.Id\)/.test(queryText)) {
+          const settings = await callExtApi('GET', `/salesforce/AdvancedSetting?versionGUID=${versionGuid}`) as PB;
+          const selected = (settings.selected as PB) ?? {};
+          const fields: PB[] = (selected.fields as PB[]) ?? [];
+          const already = fields.some((f) => f.object === 'Account' && f.name === 'Id');
+          if (!already) {
+            const newEntry: PB = {
+              object: 'Account', name: 'Id', label: 'Account ID',
+              displayName: 'Account.Id', content: 'Account.Id',
+              dataType: 'TEXT2', type: 'Text2', originalType: 'id', valueType: 'SINGLE',
+              function: 'NONE', read: true, write: false,
+              subtype: '', originalSubtype: null, relationshipName: null,
+              customObject: false, referenceFields: null, possibleValues: [],
+              defaultValue: null, dateOnly: false, reference: false,
+              url: false, picklist: false, boolean: null, lineItemField: null,
+              versionGUID: versionGuid,
+            };
+            const { accountGUID: _a, syncPrimaryQuote: _s, fields: _rf, salesforceFields: _sf, billingEntityFields: _bef, billingEntities: _be, ...rest } = settings;
+            void _a; void _s; void _rf; void _sf; void _bef; void _be;
+            await callExtApi('POST', '/salesforce/AdvancedSetting', {
+              ...rest,
+              selected: { ...selected, fields: [...fields, newEntry] },
+              changeLogRecords: [{
+                date: Date.now(),
+                username: 'DealHub Assistant', userlogin: 'extension',
+                action: 'New', object: '', objectName: '',
+                subObject: 'Salesforce fields to be used in DealHub Playbook',
+                subObjectName: 'Salesforce fields to be used in DealHub Playbook',
+                attribute: 'Salesforce field', attributeName: 'Account.Id',
+                fromValue: '', toValue: '',
+                impersonatorUserName: null, impersonatorDealhubUser: false, dealhubUser: true,
+              }],
+            });
+            sfMappingNote = 'auto-added Account.Id to /salesforce/AdvancedSetting';
+          }
+        }
+        const resp = await callExtApi('POST', '/externalQuery', {
+          guid: null,
+          name,
+          description: description ?? '',
+          entityName: entityName ?? '',
+          queryType,
+          triggerType,
+          queryText,
+          hiddenFields: [],
+          cacheExpirationHours: cacheExpirationHours ?? 0,
+          versionGUID: versionGuid,
+          changeLogRecords: [],
+        }) as PB;
+        if (!resp.id) throw new Error(`/externalQuery POST returned no id: ${JSON.stringify(resp).slice(0, 200)}`);
+        return JSON.stringify({ id: resp.id, guid: resp.guid, ...(sfMappingNote ? { sfMapping: sfMappingNote } : {}) });
+      }
+
+      // ─── Volume-discount table ─────────────────────────────────────────
+      case 'discount_table_save': {
+        const { versionGuid, id, name, tiers } = input as { versionGuid: string; id?: string; name: string; tiers: Array<{ from: number; to: number; discount: number; name?: string }> };
+        const bag = await callExtApi('GET', `/volumeDiscount?versionGUID=${versionGuid}`) as PB;
+        const all = (bag.volumeDiscounts as PB[]) ?? [];
+        const tableId = id ?? name.toLowerCase().replace(/[^a-z0-9]+/g, '_');
+        const existing = all.find((t) => t.id === tableId);
+        const others = all.filter((t) => t.id !== tableId);
+        const deletedTierGuids: string[] = existing
+          ? ((existing.fromToDiscounts as PB[]) ?? []).map((t) => t.guid as string).filter((g): g is string => !!g)
+          : [];
+        const newTable: PB = {
+          id: tableId,
+          name,
+          fromToDiscounts: tiers.map((t, i) => ({ from: t.from, to: t.to, discount: t.discount, name: t.name ?? `Tier ${i + 1}` })),
+        };
+        await callExtApi('POST', '/volumeDiscount/save', {
+          accountGUID: bag.accountGUID,
+          versionGUID: versionGuid,
+          volumeDiscounts: [...others, newTable],
+          deletedVolumeDiscounts: [],
+          deletedDiscounts: deletedTierGuids,
+          renamePriceFactors: [],
+        });
+        return `Saved discount table "${name}" (${tiers.length} tiers)${existing ? ' — replaced existing tiers' : ''}.`;
+      }
+
       case 'playbook_save': {
         if (!pb) return 'No playbook loaded.';
+        // Run guardrails BEFORE hitting the network — these mirror lib/dealhub/playbook.ts
+        // server-side enforcement so the extension can't ship broken playbook shapes.
+        preflightSave(pb);
         // Clone to avoid mutating the in-memory playbook
         const payload: PB = { ...pb };
         // Filter null-guid solutions (system-managed groups returned by GET that POST rejects)

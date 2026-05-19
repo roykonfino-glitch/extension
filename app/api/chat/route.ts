@@ -116,11 +116,12 @@ const TOOLS: Anthropic.Tool[] = [
   },
   {
     name: 'question_delete',
-    description: 'Delete a question from the loaded playbook.',
+    description: 'Delete a question from the loaded playbook. Runs a dependency check across hiddenRule / readOnlyRule / presentationRules / conditionalRules / formulas / defaultValue — if it returns "BLOCKED:" with a list of refs, rewire them first OR call again with force=true to delete anyway.',
     input_schema: {
       type: 'object',
       properties: {
         questionName: { type: 'string', description: 'Question name (use "Group.Question" if ambiguous).' },
+        force: { type: 'boolean', description: 'Bypass the dependency check.' },
       },
       required: ['questionName'],
     },
@@ -163,8 +164,98 @@ const TOOLS: Anthropic.Tool[] = [
   },
   {
     name: 'playbook_save',
-    description: 'Persist the loaded (and mutated) playbook back to DealHub. Always call this after making changes.',
+    description: 'Persist the loaded (and mutated) playbook back to DealHub. Always call this after making changes. Runs guardrail preflight first — refuses save if Product_Filters/Product_Selection are not merge-labeled, or if a Subscriptions group is placed before Product_Selection.',
     input_schema: { type: 'object', properties: {}, required: [] },
+  },
+
+  // ─── Version-level tools (cookie-authed admin API) ──────────────────────────
+  {
+    name: 'version_create',
+    description: 'Create a new blank DRAFT version on the tenant. Returns {guid,name,status}. NOTE: this is NOT a duplicate — playbooks/catalog start empty. True version duplication requires the Public Bearer API which the extension does not have.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Version name as it will appear in the Versions screen.' },
+        comment: { type: 'string', description: 'Optional free-text comment shown in the version list.' },
+      },
+      required: ['name'],
+    },
+  },
+
+  // ─── Assignment-rule templates ──────────────────────────────────────────────
+  {
+    name: 'template_list',
+    description: 'List assignment-rule templates on a version. Returns [{guid,name,assignmentRule}]. Cheap inspection — call before editing a template so you have its full shape to round-trip.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        versionGuid: { type: 'string' },
+        playbookGuid: { type: 'string', description: 'Optional — narrows to one playbook.' },
+      },
+      required: ['versionGuid'],
+    },
+  },
+  {
+    name: 'template_save',
+    description: 'Create or update one or more assignment-rule templates in a single call. Pass `changedTemplates` as an array of full template objects (round-trip via template_list first so you preserve unknown fields). To delete by name, pass `deletedTemplates: ["NAME"]`.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        versionGuid: { type: 'string' },
+        playbookGuid: { type: 'string' },
+        changedTemplates: { type: 'array', items: { type: 'object' } },
+        deletedTemplates: { type: 'array', items: { type: 'string' } },
+      },
+      required: ['versionGuid', 'playbookGuid', 'changedTemplates'],
+    },
+  },
+
+  // ─── External Query (CRM lookup saved on the version) ──────────────────────
+  {
+    name: 'external_query_create',
+    description: 'Create a saved External Query that pulls data from the connected CRM (renewals, contacts, opportunity flags, etc.) into a playbook. SF auto-fix: if queryText references EXTERNAL_FIELD(Account.Id) and the version SF mapping is missing it, this call AUTO-ADDS Account.Id to /salesforce/AdvancedSetting selected.fields[] before saving the query — preventing the silent no-op the user has been burned by. Returns {id, guid, sfMapping?}.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        versionGuid: { type: 'string' },
+        name: { type: 'string' },
+        description: { type: 'string' },
+        queryType: { type: 'string', enum: ['CRM'] },
+        triggerType: { type: 'string', enum: ['USER_REQUEST', 'AUTOMATIC'] },
+        queryText: { type: 'string', description: 'SOQL for Salesforce, JSON filter spec for HubSpot, FetchXML for MSD.' },
+        entityName: { type: 'string', description: 'CRM object name (e.g. Account, Asset).' },
+        cacheExpirationHours: { type: 'number' },
+      },
+      required: ['versionGuid', 'name', 'queryType', 'triggerType', 'queryText'],
+    },
+  },
+
+  // ─── Volume-discount table upsert ───────────────────────────────────────────
+  {
+    name: 'discount_table_save',
+    description: 'Create or replace a volume-discount table on a version. Tiers are full row objects {from,to,discount,name?}. If a table with the same id exists, its tiers are REPLACED (not merged) — the old tier guids are sent in deletedDiscounts so the server cleanly swaps.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        versionGuid: { type: 'string' },
+        id: { type: 'string', description: 'Stable table id. If omitted, derived from the name.' },
+        name: { type: 'string' },
+        tiers: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              from: { type: 'number' },
+              to: { type: 'number' },
+              discount: { type: 'number', description: 'Discount percent (e.g. 10 for 10%).' },
+              name: { type: 'string' },
+            },
+            required: ['from', 'to', 'discount'],
+          },
+        },
+      },
+      required: ['versionGuid', 'name', 'tiers'],
+    },
   },
 ];
 
@@ -209,6 +300,60 @@ function findQuestion(pb: Record<string, unknown>, name: string) {
 function quotedTextListValue(v: string) {
   const escaped = v.replace(/"/g, '\\"');
   return { id: `"${escaped}"`, text: `"${escaped}"` };
+}
+
+// ─── Guardrails ──────────────────────────────────────────────────────────────
+// Mirror of lib/dealhub/playbook.ts enforcement rules. Same logic lives in
+// app/chat/page.tsx for the extension path.
+
+function findQuestionReferences(
+  pb: Record<string, unknown>,
+  groupName: string,
+  questionName: string,
+): Array<{ group: string; question: string; field: string; snippet: string }> {
+  const refs: Array<{ group: string; question: string; field: string; snippet: string }> = [];
+  const bracketed = [`[${questionName}]`, `[${groupName}.${questionName}]`];
+  const contains = (s: unknown) => typeof s === 'string' && bracketed.some((b) => s.includes(b));
+  const ruleFields = ['hiddenRule', 'readOnlyRule', 'calculateWhenRule', 'defaultValue'];
+  for (const g of (pb.solutions as Array<Record<string, unknown>>) ?? []) {
+    for (const q of (g.solutionAttributes as Array<Record<string, unknown>>) ?? []) {
+      for (const f of ruleFields) {
+        const v = q[f];
+        if (contains(v)) refs.push({ group: g.name as string, question: q.name as string, field: f, snippet: String(v).slice(0, 120) });
+      }
+      for (const pr of (q.presentationRules as Array<Record<string, unknown>>) ?? []) {
+        if (contains(pr.rule)) refs.push({ group: g.name as string, question: q.name as string, field: 'presentationRule', snippet: String(pr.rule).slice(0, 120) });
+      }
+      for (const cr of (q.conditionalRules as Array<Record<string, unknown>>) ?? []) {
+        if (contains(cr.rule)) refs.push({ group: g.name as string, question: q.name as string, field: 'conditionalRule.rule', snippet: String(cr.rule).slice(0, 120) });
+        if (contains(cr.defaultValue)) refs.push({ group: g.name as string, question: q.name as string, field: 'conditionalRule.defaultValue', snippet: String(cr.defaultValue).slice(0, 120) });
+      }
+    }
+  }
+  return refs;
+}
+
+function preflightSave(pb: Record<string, unknown>): void {
+  const groups = (pb.solutions as Array<Record<string, unknown>>) ?? [];
+  const byName = (n: string) => groups.find((g) => g.name === n);
+  const filters = byName('Product_Filters');
+  const picker = byName('Product_Selection');
+  if (filters && picker) {
+    if (filters.displayedName !== picker.displayedName) {
+      throw new Error(`[savePlaybook preflight: MERGE_LABEL] Product_Filters.displayedName ("${filters.displayedName}") must match Product_Selection.displayedName ("${picker.displayedName}").`);
+    }
+    if (picker.showSolutionTitle !== false) {
+      throw new Error(`[savePlaybook preflight: MERGE_LABEL] Product_Selection.showSolutionTitle must be false when Product_Filters is present (currently ${picker.showSolutionTitle}).`);
+    }
+  }
+  const subs = byName('Subscriptions');
+  if (subs && picker) {
+    const subsOrdinal = groups.indexOf(subs);
+    const pickerOrdinal = groups.indexOf(picker);
+    if (subsOrdinal < pickerOrdinal) {
+      throw new Error(`[savePlaybook preflight: SUBSCRIPTIONS_ORDER] Subscriptions group (ordinal ${subsOrdinal}) must come AFTER Product_Selection (ordinal ${pickerOrdinal}).`);
+    }
+  }
 }
 
 const TYPE_MAP: Record<string, string> = {
@@ -430,6 +575,13 @@ async function executeTool(
     case 'question_delete': {
       if (!pb) return 'No playbook loaded.';
       const { group, question } = findQuestion(pb, input.questionName as string);
+      if (!input.force) {
+        const refs = findQuestionReferences(pb, group.name as string, question.name as string);
+        if (refs.length > 0) {
+          const head = refs.slice(0, 10).map((r) => `  - ${r.group}.${r.question} (${r.field}): ${r.snippet}`).join('\n');
+          return `BLOCKED: question "${input.questionName}" is referenced ${refs.length}× across the playbook. Rewire or remove these refs first, or call again with force=true to delete anyway:\n${head}${refs.length > 10 ? `\n  …and ${refs.length - 10} more` : ''}`;
+        }
+      }
       const qs = group.solutionAttributes as Array<Record<string, unknown>>;
       group.solutionAttributes = qs.filter((q) => q !== question);
       (group.solutionAttributes as Array<Record<string, unknown>>).forEach((q, i) => { q.ordinalValue = i; });
@@ -476,8 +628,154 @@ async function executeTool(
       return rule ? `Set presentation rule on "${input.questionName}" to: ${rule}` : `Cleared presentation rule on "${input.questionName}" (always shown).`;
     }
 
+    // ─── Version-level ─────────────────────────────────────────────────
+    case 'version_create': {
+      const { name, comment } = input as { name: string; comment?: string };
+      const res = await client.post<{ guid: string; name: string; status: string }>(
+        '/versions/createOrUpdate',
+        {
+          comment: comment ?? '',
+          defaultPartnerPrograms: ['', '', '', '', ''],
+          deletedPartnersGUIDs: [],
+          guid: null,
+          name,
+          status: 'DRAFT',
+        },
+      );
+      return JSON.stringify({ guid: res.guid, name: res.name, status: res.status });
+    }
+
+    // ─── Assignment-rule templates ─────────────────────────────────────
+    case 'template_list': {
+      const { versionGuid, playbookGuid } = input as { versionGuid: string; playbookGuid?: string };
+      const qs = playbookGuid
+        ? `versionGuid=${versionGuid}&playbookGuid=${playbookGuid}`
+        : `versionGuid=${versionGuid}`;
+      const raw = await client.get<Record<string, unknown>>(`/masterdata/getRuleTemplates?${qs}`);
+      const templates: Array<Record<string, unknown>> =
+        (raw.templates as Array<Record<string, unknown>>)
+        ?? (raw.changedTemplates as Array<Record<string, unknown>>)
+        ?? (Array.isArray(raw) ? raw as unknown as Array<Record<string, unknown>> : []);
+      return JSON.stringify(
+        templates.map((t) => ({ guid: t.guid, name: t.name, assignmentRule: t.assignmentRule })),
+        null, 2,
+      );
+    }
+    case 'template_save': {
+      const { versionGuid, playbookGuid, changedTemplates, deletedTemplates } = input as {
+        versionGuid: string; playbookGuid: string;
+        changedTemplates: Array<Record<string, unknown>>; deletedTemplates?: string[];
+      };
+      await client.post('/masterdata/saveRuleTemplates', {
+        playbookGuid,
+        versionGuid,
+        changedTemplates,
+        deletedTemplates: deletedTemplates ?? [],
+        changeLogRecords: [],
+      });
+      return `Saved ${changedTemplates.length} template(s)${deletedTemplates?.length ? `, deleted ${deletedTemplates.length}` : ''}.`;
+    }
+
+    // ─── External Query (with SF auto-fix) ─────────────────────────────
+    case 'external_query_create': {
+      const { versionGuid, name, description, queryType, triggerType, queryText, entityName, cacheExpirationHours } = input as {
+        versionGuid: string; name: string; description?: string;
+        queryType: string; triggerType: string; queryText: string;
+        entityName?: string; cacheExpirationHours?: number;
+      };
+      let sfMappingNote: string | null = null;
+      if (queryType === 'CRM' && /EXTERNAL_FIELD\(Account\.Id\)/.test(queryText)) {
+        const settings = await client.get<Record<string, unknown>>(
+          `/salesforce/AdvancedSetting?versionGUID=${versionGuid}`,
+        );
+        const selected = (settings.selected as Record<string, unknown>) ?? {};
+        const fields: Array<Record<string, unknown>> =
+          (selected.fields as Array<Record<string, unknown>>) ?? [];
+        const already = fields.some((f) => f.object === 'Account' && f.name === 'Id');
+        if (!already) {
+          const newEntry: Record<string, unknown> = {
+            object: 'Account', name: 'Id', label: 'Account ID',
+            displayName: 'Account.Id', content: 'Account.Id',
+            dataType: 'TEXT2', type: 'Text2', originalType: 'id', valueType: 'SINGLE',
+            function: 'NONE', read: true, write: false,
+            subtype: '', originalSubtype: null, relationshipName: null,
+            customObject: false, referenceFields: null, possibleValues: [],
+            defaultValue: null, dateOnly: false, reference: false,
+            url: false, picklist: false, boolean: null, lineItemField: null,
+            versionGUID: versionGuid,
+          };
+          const { accountGUID: _a, syncPrimaryQuote: _s, fields: _rf, salesforceFields: _sf, billingEntityFields: _bef, billingEntities: _be, ...rest } = settings;
+          void _a; void _s; void _rf; void _sf; void _bef; void _be;
+          await client.post('/salesforce/AdvancedSetting', {
+            ...rest,
+            selected: { ...selected, fields: [...fields, newEntry] },
+            changeLogRecords: [{
+              date: Date.now(),
+              username: 'DealHub Assistant', userlogin: 'web',
+              action: 'New', object: '', objectName: '',
+              subObject: 'Salesforce fields to be used in DealHub Playbook',
+              subObjectName: 'Salesforce fields to be used in DealHub Playbook',
+              attribute: 'Salesforce field', attributeName: 'Account.Id',
+              fromValue: '', toValue: '',
+              impersonatorUserName: null, impersonatorDealhubUser: false, dealhubUser: true,
+            }],
+          });
+          sfMappingNote = 'auto-added Account.Id to /salesforce/AdvancedSetting';
+        }
+      }
+      const resp = await client.post<Record<string, unknown>>('/externalQuery', {
+        guid: null,
+        name,
+        description: description ?? '',
+        entityName: entityName ?? '',
+        queryType,
+        triggerType,
+        queryText,
+        hiddenFields: [],
+        cacheExpirationHours: cacheExpirationHours ?? 0,
+        versionGUID: versionGuid,
+        changeLogRecords: [],
+      });
+      if (!resp.id) throw new Error(`/externalQuery POST returned no id: ${JSON.stringify(resp).slice(0, 200)}`);
+      return JSON.stringify({ id: resp.id, guid: resp.guid, ...(sfMappingNote ? { sfMapping: sfMappingNote } : {}) });
+    }
+
+    // ─── Volume-discount table ─────────────────────────────────────────
+    case 'discount_table_save': {
+      const { versionGuid, id, name, tiers } = input as {
+        versionGuid: string; id?: string; name: string;
+        tiers: Array<{ from: number; to: number; discount: number; name?: string }>;
+      };
+      const bag = await client.get<Record<string, unknown>>(`/volumeDiscount?versionGUID=${versionGuid}`);
+      const all = (bag.volumeDiscounts as Array<Record<string, unknown>>) ?? [];
+      const tableId = id ?? name.toLowerCase().replace(/[^a-z0-9]+/g, '_');
+      const existing = all.find((t) => t.id === tableId);
+      const others = all.filter((t) => t.id !== tableId);
+      const deletedTierGuids: string[] = existing
+        ? ((existing.fromToDiscounts as Array<Record<string, unknown>>) ?? [])
+            .map((t) => t.guid as string).filter((g): g is string => !!g)
+        : [];
+      const newTable = {
+        id: tableId,
+        name,
+        fromToDiscounts: tiers.map((t, i) => ({
+          from: t.from, to: t.to, discount: t.discount, name: t.name ?? `Tier ${i + 1}`,
+        })),
+      };
+      await client.post('/volumeDiscount/save', {
+        accountGUID: bag.accountGUID,
+        versionGUID: versionGuid,
+        volumeDiscounts: [...others, newTable],
+        deletedVolumeDiscounts: [],
+        deletedDiscounts: deletedTierGuids,
+        renamePriceFactors: [],
+      });
+      return `Saved discount table "${name}" (${tiers.length} tiers)${existing ? ' — replaced existing tiers' : ''}.`;
+    }
+
     case 'playbook_save': {
       if (!pb) return 'No playbook loaded.';
+      preflightSave(pb);
       const result = await client.post<unknown>('/playbook', pb);
       // Update cache with server response if it looks like a full playbook
       if (result && typeof result === 'object' && 'solutions' in (result as object)) {
@@ -513,7 +811,19 @@ Workflow:
 3. Make changes using mutation tools (group_create, question_create, etc.).
 4. Always call playbook_save when done with changes.
 
-Be concise and action-oriented. When the user says "add X", do it — don't ask for confirmation unless something is genuinely ambiguous. After saving, confirm what was done.${ctx}`;
+Be concise and action-oriented. When the user says "add X", do it — don't ask for confirmation unless something is genuinely ambiguous. After saving, confirm what was done.
+
+Other tools at your disposal:
+- version_create — POST /versions/createOrUpdate to mint a new blank DRAFT version. Use when only ACTIVE exists and the user wants to edit.
+- template_list / template_save — round-trip assignment-rule templates (the "bag of defaults" applied when a product is assigned). Always template_list first to get the full template shape before editing.
+- external_query_create — saved CRM query (SF/HubSpot/MSD). For SF, if queryText references EXTERNAL_FIELD(Account.Id), the tool auto-adds Account.Id to /salesforce/AdvancedSetting selected.fields[] before saving — fixes the silent no-op.
+- discount_table_save — upsert a volume-discount tier table. Same id ⇒ tiers replaced cleanly.
+
+question_delete runs a dependency check across hiddenRule / readOnlyRule / presentationRules / conditionalRules / formulas / defaultValue. If it returns "BLOCKED:", surface the refs to the user — don't bypass with force=true unless explicitly asked.
+
+playbook_save GUARDRAILS (server-side preflight will throw — fix the structure rather than bypassing):
+- MERGE_LABEL: if both Product_Filters and Product_Selection groups exist, they must share displayedName AND Product_Selection.showSolutionTitle must be false.
+- SUBSCRIPTIONS_ORDER: a Subscriptions group must come AFTER Product_Selection in the playbook order.${ctx}`;
 }
 
 // ── Main handler ──────────────────────────────────────────────────────────────
