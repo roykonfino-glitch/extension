@@ -596,12 +596,8 @@ export default function ChatPage() {
     const handler = (e: MessageEvent) => {
       if (e.data?.type !== 'dh_tab_update') return;
       const newTabUrl = e.data.tabUrl as string;
-      // Extract version GUID from hash query string (e.g. #/playbook/...?versionGUID=X&playbookGUID=Y)
-      const hashQuery = (newTabUrl.split('#')[1] ?? '').split('?')[1] ?? '';
-      const hashParams = new URLSearchParams(hashQuery);
-      const urlVersionGuid = hashParams.get('versionGUID') ?? hashParams.get('versionGuid');
-      if (urlVersionGuid) setSelectedVersionGuid(urlVersionGuid);
-      // Extract playbook GUID (UUID format)
+      // Extract playbook GUID (UUID format) — don't touch selectedVersionGuid from URL;
+      // version context is derived from the loaded playbook's own versionGUID below
       const guidMatch = newTabUrl.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
       if (!guidMatch) return;
       const newPbGuid = guidMatch[0];
@@ -641,11 +637,16 @@ export default function ChatPage() {
     try {
       while (true) {
         const loadedPb = playbookRef.current[sessionId.current];
+        // Prefer version from the loaded playbook itself; fall back to selectedVersionGuid only if it's a known version
+        const effectiveVersionGuid = loadedPb
+          ? String(loadedPb.versionGUID ?? '')
+          : (versions.some((v) => v.guid === selectedVersionGuid) ? selectedVersionGuid : undefined);
+        const effectiveVersion = versions.find((v) => v.guid === effectiveVersionGuid);
         const claudeBody = JSON.stringify({
           messages: history,
           baseUrl,
-          versionGuid: selectedVersionGuid || undefined,
-          versionName: selectedVersion?.name,
+          versionGuid: effectiveVersionGuid || undefined,
+          versionName: effectiveVersion?.name,
           tabUrl: urlParams?.tabUrl || undefined,
           playbookGuid: loadedPb ? String(loadedPb.guid ?? '') : undefined,
           playbookName: loadedPb ? String(loadedPb.name ?? '') : undefined,
