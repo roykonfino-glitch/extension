@@ -5,7 +5,7 @@
 POST /workflowSpecialRule/save
 ```
 - Rule polarity: expression = "the scenario THAT NEEDS approval" (TRUE → routes to approval)
-- Approvers: dynamic role keywords (`MANAGER` verified; `OWNER`/`ADMIN` unverified) OR specific user GUIDs
+- Approvers: `MANAGER` is the ONLY valid dynamic keyword — `OWNER`/`ADMIN`/`USER` do NOT work in DealHub; use specific user GUIDs for non-manager approvers
 - `MANAGER` gotcha: fails silently if submitting rep has no manager configured in User Management
 - `approveStepFormat: 'ALL'` verified; `'ANY'` not HAR-confirmed
 - Multi-step: academy describes but only single-step is HAR-verified
