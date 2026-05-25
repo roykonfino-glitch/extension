@@ -24,6 +24,7 @@ const TOOLS: Anthropic.Tool[] = [
   { name: 'question_set_readonly_rule', description: 'Set a Read-only rule on a question.', input_schema: { type: 'object', properties: { questionName: { type: 'string' }, rule: { type: 'string' } }, required: ['questionName','rule'] } },
   { name: 'question_set_presentation_rule', description: 'Set a presentation rule on a question (null to clear).', input_schema: { type: 'object', properties: { questionName: { type: 'string' }, rule: { type: 'string' } }, required: ['questionName','rule'] } },
   { name: 'playbook_save', description: 'Persist the loaded playbook back to DealHub. Always call after mutations.', input_schema: { type: 'object', properties: {}, required: [] } },
+  { name: 'version_duplicate', description: 'Duplicate a version via the public DealHub API (api.dealhub.io). Requires a Bearer token. Creates a new DRAFT copy of the source version asynchronously.', input_schema: { type: 'object', properties: { bearerToken: { type: 'string', description: 'Long-lived Bearer token from CPQ Admin settings' }, sourceVersionId: { type: 'string', description: 'Numeric ID of the source version (get from list_versions)' }, newVersionName: { type: 'string', description: 'Name for the new DRAFT version' }, comment: { type: 'string', description: 'Optional comment describing the reason for duplication' } }, required: ['bearerToken', 'sourceVersionId', 'newVersionName'] } },
 ];
 
 function buildSystem(baseUrl?: string, versionGuid?: string, versionName?: string, tabUrl?: string, playbookGuid?: string, playbookName?: string) {
@@ -80,7 +81,8 @@ Skip list_versions if version is in context. Skip playbook_load if playbook is a
 - 2+ questions → always use questions_bulk_create, never loop question_create.
 - Always work in DRAFT. If only ACTIVE exists, tell user to create a DRAFT first, stop.
 - To change question properties: use question_update, never delete+recreate.
-- If a tool returns "session expired": tell user "Please refresh your DealHub tab and try again." Stop.${ctx}${tabCtx}`;
+- If a tool returns "session expired": tell user "Please refresh your DealHub tab and try again." Stop.
+- version_duplicate uses the **public** API (api.dealhub.io) with a Bearer token — different from the admin cookie API. Ask user for their Bearer token if not provided. Operation is async; after calling it, tell the user duplication takes ~30s and they should reload DealHub before editing the new DRAFT.${ctx}${tabCtx}`;
 }
 
 export async function POST(req: NextRequest) {

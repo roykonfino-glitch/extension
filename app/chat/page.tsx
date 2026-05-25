@@ -497,6 +497,21 @@ export default function ChatPage() {
         if (result && typeof result === 'object' && 'solutions' in result) playbookRef.current[sid] = result;
         return `Playbook "${pb.name}" saved successfully.`;
       }
+      case 'version_duplicate': {
+        const { bearerToken, sourceVersionId, newVersionName, comment } = input as { bearerToken: string; sourceVersionId: string; newVersionName: string; comment?: string };
+        const tenantHost = baseUrl.replace(/^https?:\/\//, '').replace(/^[^.]+/, 'api');
+        const apiBase = `https://${tenantHost}`;
+        const body: Record<string, string> = { version_id: sourceVersionId, new_version_name: newVersionName };
+        if (comment) body.comment = comment;
+        const res = await fetch(`${apiBase}/api/v2/version/duplicate`, {
+          method: 'POST',
+          headers: { 'Authorization': `Bearer ${bearerToken}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        const data = await res.json() as Record<string, unknown>;
+        if (!res.ok) return `Error ${res.status}: ${JSON.stringify(data)}`;
+        return `Duplication started. request_id: ${data.request_id ?? JSON.stringify(data)}. The new DRAFT "${newVersionName}" will be ready in ~30 seconds — reload DealHub before editing it.`;
+      }
       default: return `Unknown tool: ${name}`;
     }
   };
