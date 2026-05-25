@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "dealhub-knowledge": {
+      "command": "node",
+      "args": ["/Users/roykonfino/Desktop/dealhub-app/dealhub-mcp/knowledge-server.js"]
+    }
+  }
+}
