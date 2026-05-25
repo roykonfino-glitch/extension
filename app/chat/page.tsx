@@ -361,10 +361,10 @@ export default function ChatPage() {
       case 'list_versions': {
         const raw = await callExtApi('GET', '/versions/admin?isArchived=false&versionsScreen=true') as PB[];
         const vs = raw.map((v) => ({ guid: v.guid, name: v.name, status: v.status }));
-        // Update version list in UI
+        // Update version list in UI — prefer DRAFT (always work in DRAFT per system rules)
         setVersions(vs as Version[]);
-        const active = vs.find((v) => v.status === 'ACTIVE') ?? vs[0];
-        if (active) setSelectedVersionGuid(active.guid as string);
+        const preferred = vs.find((v) => v.status === 'DRAFT') ?? vs.find((v) => v.status === 'ACTIVE') ?? vs[0];
+        if (preferred) setSelectedVersionGuid(preferred.guid as string);
         return JSON.stringify(vs);
       }
       case 'list_playbooks': {
